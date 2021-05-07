@@ -625,7 +625,12 @@ impl ConnectionCommon {
         }
     }
 
-    fn process_msg(&mut self, msg: OpaqueMessage) -> Result<Option<MessageType>, Error> {
+    fn process_msg<Data>(
+        &mut self,
+        msg: OpaqueMessage,
+        state: &mut Option<Box<dyn State<Data>>>,
+        data: &mut Data,
+    ) -> Result<(), Error> {
         // pass message to handshake state machine if any of these are true:
         // - TLS1.2 (where it's part of the state machine),
         // - prior to determining the version (it's illegal as a first message)
@@ -642,7 +647,7 @@ impl ConnectionCommon {
             } else {
                 self.common_state.received_middlebox_ccs = true;
                 trace!("Dropping CCS");
-                return Ok(None);
+                return Ok(());
             }
         }
 
@@ -668,7 +673,7 @@ impl ConnectionCommon {
                         .send_fatal_alert(AlertDescription::DecodeError);
                     Error::CorruptMessagePayload(ContentType::Handshake)
                 })?;
-            return Ok(Some(MessageType::Handshake));
+            return self.process_new_handshake_messages(state, data);
         }
 
         // Now we can fully parse the message payload.
@@ -676,13 +681,11 @@ impl ConnectionCommon {
 
         // For alerts, we have separate logic.
         if let MessagePayload::Alert(alert) = &msg.payload {
-            return self
-                .common_state
-                .process_alert(alert)
-                .map(|()| None);
+            return self.common_state.process_alert(alert);
         }
 
-        Ok(Some(MessageType::Data(msg)))
+        self.common_state
+            .process_main_protocol(msg, state, data)
     }
 
     pub(crate) fn process_new_packets<Data>(
@@ -699,19 +702,7 @@ impl ConnectionCommon {
         }
 
         while let Some(msg) = self.message_deframer.frames.pop_front() {
-            let result = self
-                .process_msg(msg)
-                .and_then(|val| match val {
-                    Some(MessageType::Handshake) => {
-                        self.process_new_handshake_messages(state, data)
-                    }
-                    Some(MessageType::Data(msg)) => self
-                        .common_state
-                        .process_main_protocol(msg, state, data),
-                    None => Ok(()),
-                });
-
-            if let Err(err) = result {
+            if let Err(err) = self.process_msg(msg, state, data) {
                 self.error = Some(err.clone());
                 return Err(err);
             }
@@ -1174,11 +1165,6 @@ pub(crate) trait State<Data>: Send + Sync {
 pub(crate) struct Context<'a, Data> {
     pub(crate) common: &'a mut CommonState,
     pub(crate) data: &'a mut Data,
-}
-
-enum MessageType {
-    Handshake,
-    Data(Message),
 }
 
 #[cfg(feature = "quic")]
