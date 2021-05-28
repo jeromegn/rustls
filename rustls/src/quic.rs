@@ -2,7 +2,7 @@
 pub use crate::cipher::Iv;
 use crate::cipher::IvLen;
 pub use crate::client::ClientQuicExt;
-use crate::conn::ConnectionCommon;
+use crate::conn::{CommonState, ConnectionCommon};
 use crate::error::Error;
 use crate::key_schedule::hkdf_expand;
 use crate::msgs::base::Payload;
@@ -165,13 +165,13 @@ pub(crate) fn read_hs(this: &mut ConnectionCommon, plaintext: &[u8]) -> Result<(
         })
         .is_none()
     {
-        this.quic.alert = Some(AlertDescription::DecodeError);
+        this.common_state.quic.alert = Some(AlertDescription::DecodeError);
         return Err(Error::CorruptMessage);
     }
     Ok(())
 }
 
-pub(crate) fn write_hs(this: &mut ConnectionCommon, buf: &mut Vec<u8>) -> Option<Keys> {
+pub(crate) fn write_hs(this: &mut CommonState, buf: &mut Vec<u8>) -> Option<Keys> {
     while let Some((_, msg)) = this.quic.hs_queue.pop_front() {
         buf.extend_from_slice(&msg);
         if let Some(&(true, _)) = this.quic.hs_queue.front() {
@@ -199,7 +199,7 @@ pub(crate) fn write_hs(this: &mut ConnectionCommon, buf: &mut Vec<u8>) -> Option
     None
 }
 
-pub(crate) fn next_1rtt_keys(this: &mut ConnectionCommon) -> Option<PacketKeySet> {
+pub(crate) fn next_1rtt_keys(this: &mut CommonState) -> Option<PacketKeySet> {
     let suite = this
         .get_suite()
         .and_then(|suite| suite.tls13())?;

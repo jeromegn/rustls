@@ -1,6 +1,6 @@
 use crate::check::{check_message, inappropriate_handshake_message, inappropriate_message};
 use crate::cipher;
-use crate::conn::{ConnectionCommon, ConnectionRandoms};
+use crate::conn::{CommonState, ConnectionRandoms};
 use crate::error::Error;
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::key_schedule::{
@@ -185,7 +185,7 @@ pub(super) fn handle_server_hello(
 }
 
 fn validate_server_hello(
-    common: &mut ConnectionCommon,
+    common: &mut CommonState,
     server_hello: &ServerHelloPayload,
 ) -> Result<(), Error> {
     for ext in &server_hello.extensions {
@@ -330,7 +330,7 @@ pub(super) fn derive_early_traffic_secret(
     trace!("Starting early data traffic");
 }
 
-pub(super) fn emit_fake_ccs(sent_tls13_fake_ccs: &mut bool, common: &mut ConnectionCommon) {
+pub(super) fn emit_fake_ccs(sent_tls13_fake_ccs: &mut bool, common: &mut CommonState) {
     if common.is_quic() {
         return;
     }
@@ -347,7 +347,7 @@ pub(super) fn emit_fake_ccs(sent_tls13_fake_ccs: &mut bool, common: &mut Connect
 }
 
 fn validate_encrypted_extensions(
-    common: &mut ConnectionCommon,
+    common: &mut CommonState,
     hello: &ClientHelloDetails,
     exts: &EncryptedExtensions,
 ) -> Result<(), Error> {
@@ -755,7 +755,7 @@ impl hs::State for ExpectCertificateVerify {
 fn emit_certificate_tls13(
     transcript: &mut HandshakeHash,
     client_auth: &mut ClientAuthDetails,
-    common: &mut ConnectionCommon,
+    common: &mut CommonState,
 ) {
     let context = client_auth
         .auth_context
@@ -789,7 +789,7 @@ fn emit_certificate_tls13(
 fn emit_certverify_tls13(
     transcript: &mut HandshakeHash,
     client_auth: &mut ClientAuthDetails,
-    common: &mut ConnectionCommon,
+    common: &mut CommonState,
 ) -> Result<(), Error> {
     let signer = match client_auth.signer.take() {
         Some(s) => s,
@@ -821,7 +821,7 @@ fn emit_certverify_tls13(
 fn emit_finished_tls13(
     transcript: &mut HandshakeHash,
     verify_data: ring::hmac::Tag,
-    common: &mut ConnectionCommon,
+    common: &mut CommonState,
 ) {
     let verify_data_payload = Payload::new(verify_data.as_ref());
 
@@ -837,7 +837,7 @@ fn emit_finished_tls13(
     common.send_msg(m, true);
 }
 
-fn emit_end_of_early_data_tls13(transcript: &mut HandshakeHash, common: &mut ConnectionCommon) {
+fn emit_end_of_early_data_tls13(transcript: &mut HandshakeHash, common: &mut CommonState) {
     if common.is_quic() {
         return;
     }
@@ -1040,7 +1040,7 @@ impl ExpectTraffic {
 
     fn handle_key_update(
         &mut self,
-        common: &mut ConnectionCommon,
+        common: &mut CommonState,
         kur: &KeyUpdateRequest,
     ) -> Result<(), Error> {
         #[cfg(feature = "quic")]
@@ -1120,7 +1120,7 @@ impl hs::State for ExpectTraffic {
             .export_keying_material(output, label, context)
     }
 
-    fn perhaps_write_key_update(&mut self, common: &mut ConnectionCommon) {
+    fn perhaps_write_key_update(&mut self, common: &mut CommonState) {
         if self.want_write_key_update {
             self.want_write_key_update = false;
             common.send_msg_encrypt(Message::build_key_update_notify().into());
