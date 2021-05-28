@@ -64,7 +64,8 @@ impl IoState {
 
 /// A structure that implements [`std::io::Read`] for reading plaintext.
 pub struct Reader<'a> {
-    common: &'a mut ConnectionCommon,
+    received_plaintext: &'a mut ChunkVecBuffer,
+    connection_at_eof: bool,
 }
 
 impl<'a> io::Read for Reader<'a> {
@@ -85,7 +86,17 @@ impl<'a> io::Read for Reader<'a> {
     /// You may learn the number of bytes available at any time by inspecting
     /// the return of [`Connection::process_new_packets`].
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.common.read(buf)
+        let len = self.received_plaintext.read(buf)?;
+        if len == 0 && !buf.is_empty() {
+            // no bytes available:
+            // - if we received a close_notify, this is a genuine permanent EOF
+            // - otherwise say EWOULDBLOCK
+            if !self.connection_at_eof {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+        }
+
+        Ok(len)
     }
 }
 
@@ -606,7 +617,12 @@ impl ConnectionCommon {
     }
 
     pub(crate) fn reader(&mut self) -> Reader {
-        Reader { common: self }
+        Reader {
+            received_plaintext: &mut self.common_state.received_plaintext,
+            /// Are we done? i.e., have we processed all received messages, and received a
+            /// close_notify to indicate that no new messages will arrive?
+            connection_at_eof: self.common_state.peer_eof && !self.message_deframer.has_pending(),
+        }
     }
 
     fn process_msg(&mut self, msg: OpaqueMessage) -> Result<Option<MessageType>, Error> {
@@ -718,36 +734,11 @@ impl ConnectionCommon {
         Ok(())
     }
 
-    /// Are we done? i.e., have we processed all received messages,
-    /// and received a close_notify to indicate that no new messages
-    /// will arrive?
-    fn connection_at_eof(&self) -> bool {
-        self.common_state.peer_eof && !self.message_deframer.has_pending()
-    }
-
     /// Read TLS content from `rd`.  This method does internal
     /// buffering, so `rd` can supply TLS messages in arbitrary-
     /// sized chunks (like a socket or pipe might).
     pub(crate) fn read_tls(&mut self, rd: &mut dyn io::Read) -> io::Result<usize> {
         self.message_deframer.read(rd)
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = self
-            .common_state
-            .received_plaintext
-            .read(buf)?;
-
-        if len == 0 && !buf.is_empty() {
-            // no bytes available:
-            // - if we received a close_notify, this is a genuine permanent EOF
-            // - otherwise say EWOULDBLOCK
-            if !self.connection_at_eof() {
-                return Err(io::ErrorKind::WouldBlock.into());
-            }
-        }
-
-        Ok(len)
     }
 }
 
