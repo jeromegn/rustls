@@ -819,6 +819,7 @@ pub(crate) struct CommonState {
     sent_fatal_alert: bool,
     peer_eof: bool,
     received_middlebox_ccs: bool,
+    pub(crate) peer_certificates: Option<Vec<key::Certificate>>,
     message_fragmenter: MessageFragmenter,
     received_plaintext: ChunkVecBuffer,
     sendable_plaintext: ChunkVecBuffer,
@@ -844,6 +845,7 @@ impl CommonState {
             sent_fatal_alert: false,
             peer_eof: false,
             received_middlebox_ccs: false,
+            peer_certificates: None,
             message_fragmenter: MessageFragmenter::new(max_fragment_size)
                 .map_err(|_| Error::BadMaxFragmentSize)?,
             received_plaintext: ChunkVecBuffer::new(Some(0)),

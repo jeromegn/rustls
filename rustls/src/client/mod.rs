@@ -11,7 +11,7 @@ use crate::msgs::enums::AlertDescription;
 use crate::msgs::enums::CipherSuite;
 use crate::msgs::enums::ProtocolVersion;
 use crate::msgs::enums::SignatureScheme;
-use crate::msgs::handshake::{CertificatePayload, ClientExtension};
+use crate::msgs::handshake::ClientExtension;
 use crate::sign;
 use crate::suites::SupportedCipherSuite;
 use crate::verify;
@@ -533,16 +533,10 @@ impl Connection for ClientConnection {
     }
 
     fn peer_certificates(&self) -> Option<&[key::Certificate]> {
-        if self
-            .inner
-            .data
-            .server_cert_chain
-            .is_empty()
-        {
-            return None;
-        }
-
-        Some(&self.inner.data.server_cert_chain)
+        self.inner
+            .common_state
+            .peer_certificates
+            .as_deref()
     }
 
     fn alpn_protocol(&self) -> Option<&[u8]> {
@@ -584,7 +578,6 @@ impl Connection for ClientConnection {
 }
 
 struct ClientConnectionData {
-    server_cert_chain: CertificatePayload,
     early_data: EarlyData,
     resumption_ciphersuite: Option<SupportedCipherSuite>,
 }
@@ -592,7 +585,6 @@ struct ClientConnectionData {
 impl ClientConnectionData {
     fn new() -> Self {
         Self {
-            server_cert_chain: Vec::new(),
             early_data: EarlyData::new(),
             resumption_ciphersuite: None,
         }

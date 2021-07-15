@@ -438,9 +438,11 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                     ));
             }
 
-            cx.data.server_cert_chain = resuming_session
-                .server_cert_chain
-                .clone();
+            cx.common.peer_certificates = Some(
+                resuming_session
+                    .server_cert_chain
+                    .clone(),
+            );
 
             // We *don't* reverify the certificate chain here: resumption is a
             // continuation of the previous session in terms of security policy.
@@ -736,7 +738,7 @@ impl State<ClientConnectionData> for ExpectCertificateVerify {
             )
             .map_err(|err| hs::send_cert_error_alert(cx.common, err))?;
 
-        cx.data.server_cert_chain = self.server_cert.cert_chain;
+        cx.common.peer_certificates = Some(self.server_cert.cert_chain);
         self.transcript.add_message(&m);
 
         Ok(Box::new(ExpectFinished {
@@ -996,7 +998,10 @@ impl ExpectTraffic {
             &SessionID::empty(),
             nst.ticket.0.clone(),
             secret,
-            &cx.data.server_cert_chain,
+            cx.common
+                .peer_certificates
+                .clone()
+                .unwrap_or_default(),
             time_now,
         );
         value.set_times(nst.lifetime, nst.age_add);

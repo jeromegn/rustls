@@ -373,8 +373,8 @@ impl Connection for ServerConnection {
 
     fn peer_certificates(&self) -> Option<&[key::Certificate]> {
         self.inner
-            .data
-            .client_cert_chain
+            .common_state
+            .peer_certificates
             .as_deref()
     }
 
@@ -425,8 +425,6 @@ struct ServerConnectionData {
     sni: Option<webpki::DnsName>,
     received_resumption_data: Option<Vec<u8>>,
     resumption_data: Vec<u8>,
-    client_cert_chain: Option<Vec<key::Certificate>>,
-
     #[allow(dead_code)] // only supported for QUIC currently
     /// Whether to reject early data even if it would otherwise be accepted
     reject_early_data: bool,
