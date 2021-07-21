@@ -537,6 +537,42 @@ impl<Data> ConnectionCommon<Data> {
         }
     }
 
+    /// Extract the first handshake message.
+    ///
+    /// This is a shortcut to the `process_new_packets()` -> `process_msg()` ->
+    /// `process_handshake_messages()` path, specialized for the first handshake message.
+    pub(crate) fn first_handshake_message(&mut self) -> Result<Option<Message>, Error> {
+        if self.message_deframer.desynced {
+            return Err(Error::CorruptMessage);
+        }
+
+        while let Some(msg) = self.message_deframer.frames.pop_front() {
+            let msg = msg.into_plain_message();
+            if !self.handshake_joiner.want_message(&msg) {
+                continue;
+            }
+
+            if self
+                .handshake_joiner
+                .take_message(msg)
+                .is_none()
+            {
+                self.common_state
+                    .send_fatal_alert(AlertDescription::DecodeError);
+                return Err(Error::CorruptMessagePayload(ContentType::Handshake));
+            }
+
+            self.common_state.aligned_handshake = self.handshake_joiner.is_empty();
+            return Ok(self.handshake_joiner.frames.pop_front());
+        }
+
+        Ok(None)
+    }
+
+    pub(crate) fn replace_state(&mut self, new: Box<dyn State<Data>>) {
+        self.state = Ok(new);
+    }
+
     fn process_msg(
         &mut self,
         msg: OpaqueMessage,

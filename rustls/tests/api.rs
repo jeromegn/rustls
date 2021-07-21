@@ -18,6 +18,7 @@ use rustls::ClientHello;
 use rustls::Connection;
 use rustls::Error;
 use rustls::KeyLog;
+use rustls::ResolvesServerConfig;
 use rustls::{CipherSuite, ProtocolVersion, SignatureScheme};
 use rustls::{ClientConfig, ClientConnection, ResolvesClientCert};
 use rustls::{ResolvesServerCert, ServerConfig, ServerConnection};
@@ -3737,4 +3738,48 @@ fn test_server_rejects_clients_without_any_kx_group_overlap() {
             "no kx group overlap with client".into()
         ))
     );
+}
+
+#[test]
+fn test_acceptor_happy_path() {
+    let server_config = make_server_config(KeyType::ED25519);
+
+    struct ConfigResolver {
+        config: Arc<ServerConfig>,
+    }
+
+    impl ResolvesServerConfig for ConfigResolver {
+        fn resolve(
+            &self,
+            hello: ClientHello<'_>,
+        ) -> Option<(Arc<ServerConfig>, Arc<sign::CertifiedKey>)> {
+            self.config
+                .cert_resolver
+                .resolve(hello)
+                .map(|cert| (self.config.clone(), cert))
+        }
+    }
+
+    let mut acceptor = rustls::Acceptor::new(
+        Arc::new(ConfigResolver {
+            config: Arc::new(server_config),
+        }),
+        None,
+    )
+    .unwrap();
+
+    let client_config = make_client_config(KeyType::ED25519);
+    let mut client = ClientConnection::new(Arc::new(client_config), dns_name("localhost")).unwrap();
+    let mut buf = Vec::new();
+    client.write_tls(&mut buf).unwrap();
+
+    acceptor
+        .read_tls(&mut buf.as_slice())
+        .unwrap();
+    let accepted = acceptor
+        .read_client_hello()
+        .unwrap()
+        .unwrap();
+    let server = acceptor.into_connection(accepted);
+    assert!(server.wants_write());
 }

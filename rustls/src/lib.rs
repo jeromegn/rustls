@@ -341,8 +341,8 @@ pub use crate::server::builder::WantsServerCert;
 pub use crate::server::handy::ResolvesServerCertUsingSni;
 pub use crate::server::handy::{NoServerSessionStorage, ServerSessionMemoryCache};
 pub use crate::server::StoresServerSessions;
-pub use crate::server::{ClientHello, ProducesTickets, ResolvesServerCert};
-pub use crate::server::{ServerConfig, ServerConnection};
+pub use crate::server::{Accepted, Acceptor, ServerConfig, ServerConnection};
+pub use crate::server::{ClientHello, ProducesTickets, ResolvesServerCert, ResolvesServerConfig};
 pub use crate::stream::{Stream, StreamOwned};
 pub use crate::suites::{
     BulkAlgorithm, SupportedCipherSuite, Tls12CipherSuite, Tls13CipherSuite, ALL_CIPHER_SUITES,

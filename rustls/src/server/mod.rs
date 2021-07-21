@@ -1,13 +1,17 @@
 use crate::builder::{ConfigBuilder, WantsCipherSuites};
-use crate::conn::{CommonState, Connection, ConnectionCommon, IoState, Reader, Writer};
+use crate::conn::{CommonState, Connection, ConnectionCommon, IoState, Reader, State, Writer};
 use crate::error::Error;
 use crate::keylog::KeyLog;
 use crate::kx::SupportedKxGroup;
+#[cfg(feature = "logging")]
+use crate::log::trace;
+use crate::msgs::base::PayloadU8;
 #[cfg(feature = "quic")]
 use crate::msgs::enums::AlertDescription;
 use crate::msgs::enums::ProtocolVersion;
 use crate::msgs::enums::SignatureScheme;
-use crate::msgs::handshake::ServerExtension;
+use crate::msgs::handshake::{ConvertProtocolNameList, ServerExtension};
+use crate::msgs::message::Message;
 use crate::sign;
 use crate::suites::SupportedCipherSuite;
 use crate::verify;
@@ -107,16 +111,25 @@ pub trait ResolvesServerCert: Send + Sync {
 pub struct ClientHello<'a> {
     server_name: Option<webpki::DnsNameRef<'a>>,
     signature_schemes: &'a [SignatureScheme],
-    alpn: Option<&'a [&'a [u8]]>,
+    alpn: Option<Vec<&'a [u8]>>,
 }
 
 impl<'a> ClientHello<'a> {
     /// Creates a new ClientHello
-    fn new(
-        server_name: Option<webpki::DnsNameRef<'a>>,
-        signature_schemes: &'a [SignatureScheme],
-        alpn: Option<&'a [&'a [u8]]>,
+    fn new<'sni: 'a, 'sigs: 'a, 'alpn: 'a>(
+        sni: &'sni Option<webpki::DnsName>,
+        signature_schemes: &'sigs [SignatureScheme],
+        alpn: Option<&'alpn Vec<PayloadU8>>,
     ) -> Self {
+        let server_name = sni
+            .as_ref()
+            .map(webpki::DnsName::as_ref);
+        let alpn = alpn.map(|protos| protos.to_slices());
+
+        trace!("sni {:?}", server_name);
+        trace!("sig schemes {:?}", signature_schemes);
+        trace!("alpn protocols {:?}", alpn);
+
         ClientHello {
             server_name,
             signature_schemes,
@@ -143,8 +156,8 @@ impl<'a> ClientHello<'a> {
     /// Get the alpn.
     ///
     /// Returns `None` if the client did not include an ALPN extension
-    pub fn alpn(&self) -> Option<&'a [&'a [u8]]> {
-        self.alpn
+    pub fn alpn(&self) -> Option<&[&[u8]]> {
+        self.alpn.as_deref()
     }
 }
 
@@ -378,6 +391,130 @@ impl DerefMut for ServerConnection {
     }
 }
 
+/// Handle on a server-side connection before configuration is available.
+///
+/// The `Acceptor` allows the caller to provide a [`ServerConfig`] that is customized
+/// based on the [`ClientHello`] of the incoming connection. Using the [`ResolvesServerConfig`]
+/// trait, the caller can build a [`ServerConfig`] and [`sign::CertifiedKey`] based on the
+/// `ClientHello`.
+pub struct Acceptor {
+    resolver: Arc<dyn ResolvesServerConfig>,
+    inner: ConnectionCommon<ServerConnectionData>,
+}
+
+impl Acceptor {
+    /// Create a new `Acceptor`.
+    pub fn new(
+        resolver: Arc<dyn ResolvesServerConfig>,
+        max_fragment_size: Option<usize>,
+    ) -> Result<Self, Error> {
+        let common = CommonState::new(max_fragment_size, false)?;
+        let state = Box::new(Accepting);
+        Ok(Self {
+            resolver,
+            inner: ConnectionCommon::new(state, Default::default(), common),
+        })
+    }
+
+    /// Read TLS content from `rd`.
+    ///
+    /// For more details, see [`Connection::read_tls()`].
+    pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> Result<usize, io::Error> {
+        self.inner.read_tls(rd)
+    }
+
+    /// Check if a `ClientHello` message has been received.
+    ///
+    /// Returns an error if the `ClientHello` message is invalid or `Ok(None)` if no complete
+    /// `ClientHello` has been received yet. If `Some(Accepted)` is returned, the [`Accepted`] token
+    /// type can be used to turn the `Acceptor` into a [`ServerConnection`] using
+    /// [`Acceptor::into_connection()`].
+    pub fn read_client_hello(&mut self) -> Result<Option<Accepted>, Error> {
+        let msg = match self.inner.first_handshake_message() {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let (sig_schemes, client_hello) = hs::process_client_hello(
+            &msg,
+            false,
+            &mut self.inner.common_state,
+            &mut self.inner.data,
+        )?;
+
+        let ch = ClientHello::new(
+            &self.inner.data.sni,
+            &sig_schemes,
+            client_hello.get_alpn_extension(),
+        );
+
+        let (config, key) = match self.resolver.resolve(ch) {
+            Some((config, key)) => (config, key),
+            None => return Err(Error::General("no server config resolved".to_string())),
+        };
+
+        let state = hs::ExpectClientHello::new(config, Vec::new());
+        let mut cx = hs::ServerContext {
+            common: &mut self.inner.common_state,
+            data: &mut self.inner.data,
+        };
+
+        let new = state.with_certified_key(key, sig_schemes, client_hello, &msg, &mut cx)?;
+        self.inner.replace_state(new);
+        Ok(Some(Accepted(())))
+    }
+
+    /// Turn the [`Acceptor`] into a [`ServerConnection`].
+    ///
+    /// Requires an [`Accepted`] token as returned from [`Acceptor::read_client_hello`].
+    pub fn into_connection(self, _accepted: Accepted) -> ServerConnection {
+        ServerConnection { inner: self.inner }
+    }
+}
+
+impl Deref for Acceptor {
+    type Target = CommonState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner.common_state
+    }
+}
+
+impl DerefMut for Acceptor {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner.common_state
+    }
+}
+
+/// Trait that lets the implementer provide a [`ServerConfig`] based on the [`ClientHello`].
+pub trait ResolvesServerConfig: Send + Sync {
+    /// Resolve a [`ServerConfig`] and [`sign::CertifiedKey`] based on the [`ClientHello`].
+    ///
+    /// If this method returns `None`, the handshake will fail.
+    fn resolve(
+        &self,
+        hello: ClientHello<'_>,
+    ) -> Option<(Arc<ServerConfig>, Arc<sign::CertifiedKey>)>;
+}
+
+/// Token type used by the [`Acceptor`] to signal the connection can continue.
+#[derive(Debug)]
+pub struct Accepted(());
+
+struct Accepting;
+
+impl State<ServerConnectionData> for Accepting {
+    fn handle(
+        self: Box<Self>,
+        _cx: &mut hs::ServerContext<'_>,
+        _m: Message,
+    ) -> Result<Box<dyn State<ServerConnectionData>>, Error> {
+        unreachable!()
+    }
+}
+
+/// State associated with a server connection.
 #[derive(Default)]
 struct ServerConnectionData {
     sni: Option<webpki::DnsName>,
