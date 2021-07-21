@@ -529,12 +529,6 @@ impl ServerConnectionData {
     fn get_sni_str(&self) -> Option<&str> {
         self.sni.as_ref().map(AsRef::as_ref)
     }
-
-    fn get_sni(&self) -> Option<verify::DnsName> {
-        self.sni
-            .as_ref()
-            .map(|name| verify::DnsName(name.clone()))
-    }
 }
 
 #[cfg(feature = "quic")]
