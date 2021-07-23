@@ -1,24 +1,27 @@
 use crate::builder::{ConfigBuilder, WantsCipherSuites};
-use crate::conn::{Connection, ConnectionCommon, IoState, PlaintextSink, Reader, Writer};
+use crate::conn::{CommonState, Connection, ConnectionCommon, IoState, Reader, State, Writer};
 use crate::error::Error;
-use crate::key;
 use crate::keylog::KeyLog;
 use crate::kx::SupportedKxGroup;
+#[cfg(feature = "logging")]
+use crate::log::trace;
+use crate::msgs::base::PayloadU8;
 #[cfg(feature = "quic")]
 use crate::msgs::enums::AlertDescription;
 use crate::msgs::enums::ProtocolVersion;
 use crate::msgs::enums::SignatureScheme;
-use crate::msgs::handshake::ServerExtension;
+use crate::msgs::handshake::{ConvertProtocolNameList, ServerExtension};
+use crate::msgs::message::Message;
 use crate::sign;
 use crate::suites::SupportedCipherSuite;
 use crate::verify;
 #[cfg(feature = "quic")]
 use crate::{conn::Protocol, quic};
 
-use std::fmt;
-use std::io::{self, IoSlice};
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::{fmt, io};
 
 #[macro_use]
 mod hs;
@@ -108,16 +111,25 @@ pub trait ResolvesServerCert: Send + Sync {
 pub struct ClientHello<'a> {
     server_name: Option<webpki::DnsNameRef<'a>>,
     signature_schemes: &'a [SignatureScheme],
-    alpn: Option<&'a [&'a [u8]]>,
+    alpn: Option<Vec<&'a [u8]>>,
 }
 
 impl<'a> ClientHello<'a> {
     /// Creates a new ClientHello
-    fn new(
-        server_name: Option<webpki::DnsNameRef<'a>>,
-        signature_schemes: &'a [SignatureScheme],
-        alpn: Option<&'a [&'a [u8]]>,
+    fn new<'sni: 'a, 'sigs: 'a, 'alpn: 'a>(
+        sni: &'sni Option<webpki::DnsName>,
+        signature_schemes: &'sigs [SignatureScheme],
+        alpn: Option<&'alpn Vec<PayloadU8>>,
     ) -> Self {
+        let server_name = sni
+            .as_ref()
+            .map(webpki::DnsName::as_ref);
+        let alpn = alpn.map(|protos| protos.to_slices());
+
+        trace!("sni {:?}", server_name);
+        trace!("sig schemes {:?}", signature_schemes);
+        trace!("alpn protocols {:?}", alpn);
+
         ClientHello {
             server_name,
             signature_schemes,
@@ -144,8 +156,8 @@ impl<'a> ClientHello<'a> {
     /// Get the alpn.
     ///
     /// Returns `None` if the client did not include an ALPN extension
-    pub fn alpn(&self) -> Option<&'a [&'a [u8]]> {
-        self.alpn
+    pub fn alpn(&self) -> Option<&[&[u8]]> {
+        self.alpn.as_deref()
     }
 }
 
@@ -246,9 +258,7 @@ impl ServerConfig {
 /// Send TLS-protected data to the peer using the `io::Write` trait implementation.
 /// Read data from the peer using the `io::Read` trait implementation.
 pub struct ServerConnection {
-    common: ConnectionCommon,
-    state: Option<Box<dyn hs::State>>,
-    data: ServerConnectionData,
+    inner: ConnectionCommon<ServerConnectionData>,
 }
 
 impl ServerConnection {
@@ -262,10 +272,13 @@ impl ServerConnection {
         config: Arc<ServerConfig>,
         extra_exts: Vec<ServerExtension>,
     ) -> Result<Self, Error> {
+        let common = CommonState::new(config.max_fragment_size, false)?;
         Ok(Self {
-            common: ConnectionCommon::new(config.max_fragment_size, false)?,
-            state: Some(Box::new(hs::ExpectClientHello::new(config, extra_exts))),
-            data: ServerConnectionData::default(),
+            inner: ConnectionCommon::new(
+                Box::new(hs::ExpectClientHello::new(config, extra_exts)),
+                ServerConnectionData::default(),
+                common,
+            ),
         })
     }
 
@@ -286,7 +299,7 @@ impl ServerConnection {
     /// The SNI hostname is also used to match sessions during session
     /// resumption.
     pub fn sni_hostname(&self) -> Option<&str> {
-        self.data.get_sni_str()
+        self.inner.data.get_sni_str()
     }
 
     /// Application-controlled portion of the resumption ticket supplied by the client, if any.
@@ -295,7 +308,8 @@ impl ServerConnection {
     ///
     /// Returns `Some` iff a valid resumption ticket has been received from the client.
     pub fn received_resumption_data(&self) -> Option<&[u8]> {
-        self.data
+        self.inner
+            .data
             .received_resumption_data
             .as_ref()
             .map(|x| &x[..])
@@ -311,7 +325,7 @@ impl ServerConnection {
     /// from the client is desired, encrypt the data separately.
     pub fn set_resumption_data(&mut self, data: &[u8]) {
         assert!(data.len() < 2usize.pow(15));
-        self.data.resumption_data = data.into();
+        self.inner.data.resumption_data = data.into();
     }
 
     /// Explicitly discard early data, notifying the client
@@ -324,64 +338,17 @@ impl ServerConnection {
             self.is_handshaking(),
             "cannot retroactively reject early data"
         );
-        self.data.reject_early_data = true;
-    }
-
-    fn send_some_plaintext(&mut self, buf: &[u8]) -> usize {
-        let mut st = self.state.take();
-        if let Some(st) = st.as_mut() {
-            st.perhaps_write_key_update(&mut self.common);
-        }
-        self.state = st;
-        self.common.send_some_plaintext(buf)
+        self.inner.data.reject_early_data = true;
     }
 }
 
 impl Connection for ServerConnection {
     fn read_tls(&mut self, rd: &mut dyn io::Read) -> io::Result<usize> {
-        self.common.read_tls(rd)
-    }
-
-    /// Writes TLS messages to `wr`.
-    fn write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
-        self.common.write_tls(wr)
+        self.inner.read_tls(rd)
     }
 
     fn process_new_packets(&mut self) -> Result<IoState, Error> {
-        self.common
-            .process_new_packets(&mut self.state, &mut self.data)
-    }
-
-    fn wants_read(&self) -> bool {
-        self.common.wants_read()
-    }
-
-    fn wants_write(&self) -> bool {
-        !self.common.sendable_tls.is_empty()
-    }
-
-    fn is_handshaking(&self) -> bool {
-        !self.common.traffic
-    }
-
-    fn set_buffer_limit(&mut self, len: Option<usize>) {
-        self.common.set_buffer_limit(len)
-    }
-
-    fn send_close_notify(&mut self) {
-        self.common.send_close_notify()
-    }
-
-    fn peer_certificates(&self) -> Option<&[key::Certificate]> {
-        self.data.client_cert_chain.as_deref()
-    }
-
-    fn alpn_protocol(&self) -> Option<&[u8]> {
-        self.common.get_alpn_protocol()
-    }
-
-    fn protocol_version(&self) -> Option<ProtocolVersion> {
-        self.common.negotiated_version
+        self.inner.process_new_packets()
     }
 
     fn export_keying_material(
@@ -390,40 +357,16 @@ impl Connection for ServerConnection {
         label: &[u8],
         context: Option<&[u8]>,
     ) -> Result<(), Error> {
-        self.state
-            .as_ref()
-            .ok_or(Error::HandshakeNotComplete)
-            .and_then(|st| st.export_keying_material(output, label, context))
-    }
-
-    fn negotiated_cipher_suite(&self) -> Option<SupportedCipherSuite> {
-        self.common.get_suite()
+        self.inner
+            .export_keying_material(output, label, context)
     }
 
     fn writer(&mut self) -> Writer {
-        Writer::new(self)
+        Writer::new(&mut self.inner)
     }
 
     fn reader(&mut self) -> Reader {
-        self.common.reader()
-    }
-}
-
-impl PlaintextSink for ServerConnection {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Ok(self.send_some_plaintext(buf))
-    }
-
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        let mut sz = 0;
-        for buf in bufs {
-            sz += self.send_some_plaintext(buf);
-        }
-        Ok(sz)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.inner.reader()
     }
 }
 
@@ -434,13 +377,149 @@ impl fmt::Debug for ServerConnection {
     }
 }
 
+impl Deref for ServerConnection {
+    type Target = CommonState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner.common_state
+    }
+}
+
+impl DerefMut for ServerConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner.common_state
+    }
+}
+
+/// Handle on a server-side connection before configuration is available.
+///
+/// The `Acceptor` allows the caller to provide a [`ServerConfig`] that is customized
+/// based on the [`ClientHello`] of the incoming connection. Using the [`ResolvesServerConfig`]
+/// trait, the caller can build a [`ServerConfig`] and [`sign::CertifiedKey`] based on the
+/// `ClientHello`.
+pub struct Acceptor {
+    resolver: Arc<dyn ResolvesServerConfig>,
+    inner: ConnectionCommon<ServerConnectionData>,
+}
+
+impl Acceptor {
+    /// Create a new `Acceptor`.
+    pub fn new(
+        resolver: Arc<dyn ResolvesServerConfig>,
+        max_fragment_size: Option<usize>,
+    ) -> Result<Self, Error> {
+        let common = CommonState::new(max_fragment_size, false)?;
+        let state = Box::new(Accepting);
+        Ok(Self {
+            resolver,
+            inner: ConnectionCommon::new(state, Default::default(), common),
+        })
+    }
+
+    /// Read TLS content from `rd`.
+    ///
+    /// For more details, see [`Connection::read_tls()`].
+    pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> Result<usize, io::Error> {
+        self.inner.read_tls(rd)
+    }
+
+    /// Check if a `ClientHello` message has been received.
+    ///
+    /// Returns an error if the `ClientHello` message is invalid or `Ok(None)` if no complete
+    /// `ClientHello` has been received yet. If `Some(Accepted)` is returned, the [`Accepted`] token
+    /// type can be used to turn the `Acceptor` into a [`ServerConnection`] using
+    /// [`Acceptor::into_connection()`].
+    pub fn read_client_hello(&mut self) -> Result<Option<Accepted>, Error> {
+        let msg = match self.inner.first_handshake_message() {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let (sig_schemes, client_hello) = hs::process_client_hello(
+            &msg,
+            false,
+            &mut self.inner.common_state,
+            &mut self.inner.data,
+        )?;
+
+        let ch = ClientHello::new(
+            &self.inner.data.sni,
+            &sig_schemes,
+            client_hello.get_alpn_extension(),
+        );
+
+        let (config, key) = match self.resolver.resolve(ch) {
+            Some((config, key)) => (config, key),
+            None => return Err(Error::General("no server config resolved".to_string())),
+        };
+
+        let state = hs::ExpectClientHello::new(config, Vec::new());
+        let mut cx = hs::ServerContext {
+            common: &mut self.inner.common_state,
+            data: &mut self.inner.data,
+        };
+
+        let new = state.with_certified_key(key, sig_schemes, client_hello, &msg, &mut cx)?;
+        self.inner.replace_state(new);
+        Ok(Some(Accepted(())))
+    }
+
+    /// Turn the [`Acceptor`] into a [`ServerConnection`].
+    ///
+    /// Requires an [`Accepted`] token as returned from [`Acceptor::read_client_hello`].
+    pub fn into_connection(self, _accepted: Accepted) -> ServerConnection {
+        ServerConnection { inner: self.inner }
+    }
+}
+
+impl Deref for Acceptor {
+    type Target = CommonState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner.common_state
+    }
+}
+
+impl DerefMut for Acceptor {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner.common_state
+    }
+}
+
+/// Trait that lets the implementer provide a [`ServerConfig`] based on the [`ClientHello`].
+pub trait ResolvesServerConfig: Send + Sync {
+    /// Resolve a [`ServerConfig`] and [`sign::CertifiedKey`] based on the [`ClientHello`].
+    ///
+    /// If this method returns `None`, the handshake will fail.
+    fn resolve(
+        &self,
+        hello: ClientHello<'_>,
+    ) -> Option<(Arc<ServerConfig>, Arc<sign::CertifiedKey>)>;
+}
+
+/// Token type used by the [`Acceptor`] to signal the connection can continue.
+#[derive(Debug)]
+pub struct Accepted(());
+
+struct Accepting;
+
+impl State<ServerConnectionData> for Accepting {
+    fn handle(
+        self: Box<Self>,
+        _cx: &mut hs::ServerContext<'_>,
+        _m: Message,
+    ) -> Result<Box<dyn State<ServerConnectionData>>, Error> {
+        unreachable!()
+    }
+}
+
+/// State associated with a server connection.
 #[derive(Default)]
 struct ServerConnectionData {
     sni: Option<webpki::DnsName>,
     received_resumption_data: Option<Vec<u8>>,
     resumption_data: Vec<u8>,
-    client_cert_chain: Option<Vec<key::Certificate>>,
-
     #[allow(dead_code)] // only supported for QUIC currently
     /// Whether to reject early data even if it would otherwise be accepted
     reject_early_data: bool,
@@ -450,18 +529,13 @@ impl ServerConnectionData {
     fn get_sni_str(&self) -> Option<&str> {
         self.sni.as_ref().map(AsRef::as_ref)
     }
-
-    fn get_sni(&self) -> Option<verify::DnsName> {
-        self.sni
-            .as_ref()
-            .map(|name| verify::DnsName(name.clone()))
-    }
 }
 
 #[cfg(feature = "quic")]
 impl quic::QuicExt for ServerConnection {
     fn quic_transport_parameters(&self) -> Option<&[u8]> {
-        self.common
+        self.inner
+            .common_state
             .quic
             .params
             .as_ref()
@@ -470,29 +544,32 @@ impl quic::QuicExt for ServerConnection {
 
     fn zero_rtt_keys(&self) -> Option<quic::DirectionalKeys> {
         Some(quic::DirectionalKeys::new(
-            self.common
-                .get_suite()
+            self.inner
+                .common_state
+                .suite
                 .and_then(|suite| suite.tls13())?,
-            self.common.quic.early_secret.as_ref()?,
+            self.inner
+                .common_state
+                .quic
+                .early_secret
+                .as_ref()?,
         ))
     }
 
     fn read_hs(&mut self, plaintext: &[u8]) -> Result<(), Error> {
-        quic::read_hs(&mut self.common, plaintext)?;
-        self.common
-            .process_new_handshake_messages(&mut self.state, &mut self.data)
+        self.inner.read_quic_hs(plaintext)
     }
 
     fn write_hs(&mut self, buf: &mut Vec<u8>) -> Option<quic::Keys> {
-        quic::write_hs(&mut self.common, buf)
+        quic::write_hs(&mut self.inner.common_state, buf)
     }
 
     fn alert(&self) -> Option<AlertDescription> {
-        self.common.quic.alert
+        self.inner.common_state.quic.alert
     }
 
     fn next_1rtt_keys(&mut self) -> Option<quic::PacketKeySet> {
-        quic::next_1rtt_keys(&mut self.common)
+        quic::next_1rtt_keys(&mut self.inner.common_state)
     }
 }
 
@@ -524,7 +601,7 @@ pub trait ServerQuicExt {
             quic::Version::V1 => ServerExtension::TransportParameters(params),
         };
         let mut new = ServerConnection::from_config(config, vec![ext])?;
-        new.common.protocol = Protocol::Quic;
+        new.inner.common_state.protocol = Protocol::Quic;
         Ok(new)
     }
 }

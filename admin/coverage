@@ -72,17 +72,17 @@ all_infos = []
 
 # unit tests
 cleanup()
-rustc('--package', 'rustls', '--profile', 'test', '--lib')
+rustc('--package', 'rustls', '-Zunstable-options', '--profile', 'test', '--lib')
 run('rustls')
 all_infos.append(lcov('rustls.info'))
 
 cleanup()
 for example in 'bench bogo_shim trytls_shim'.split():
-    rustc('--package', 'rustls', '--profile', 'dev', '--example', example)
+    rustc('--package', 'rustls', '-Zunstable-options', '--profile', 'dev', '--example', example)
 
 # crate-level tests
 for test in 'api'.split():
-    rustc('--package', 'rustls', '--profile', 'dev', '--test', test)
+    rustc('--package', 'rustls', '-Zunstable-options', '--profile', 'dev', '--test', test)
     run(test)
 
 # trytls/bogo
