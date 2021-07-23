@@ -718,7 +718,11 @@ impl<Data> ConnectionCommon<Data> {
     /// buffering, so `rd` can supply TLS messages in arbitrary-
     /// sized chunks (like a socket or pipe might).
     pub(crate) fn read_tls(&mut self, rd: &mut dyn io::Read) -> io::Result<usize> {
-        self.message_deframer.read(rd)
+        let res = self.message_deframer.read(rd);
+        if let Ok(0) = res {
+            self.common_state.peer_eof = true;
+        }
+        res
     }
 
     pub(crate) fn export_keying_material(
